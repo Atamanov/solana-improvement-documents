@@ -14,7 +14,7 @@ feature: (fill in with feature tracking issues once accepted)
 ## Summary
 
 This proposal introduces four BN254 (`alt_bn128`) syscalls that complete the
-on-chain verifier surface for pairing-based cryptography. These syscalls will
+on-chain verifier surface for pairing-based cryptography. These syscalls
 expose:
 
 1. **G1 multi-scalar multiplication** (`alt_bn128_g1_msm`)
@@ -31,75 +31,58 @@ activate independently of SIMD-0302.
 
 ## Motivation
 
-Zero-knowledge proofs on Solana are verified one at a time, and verification
-dominates the cost of every ZK application. A single Groth16 verification
-measures about 96k CU on the uncommitted rail (one public input) and 231k
-CU on the committed rail against the current syscalls. Real transactions
-carry more than one proof, composed like CPI depth: in the authors' privacy
-pool deployment a swap's rule proof calls into the pool's transact proof,
-and a policy ring inserts a third hop; two or three proofs per transaction
-is the common case, five the composability ceiling. Independent
-verification scales linearly and hits the compute ceiling fast: five proofs
-burn a third of the 1.4M CU transaction cap before any state effect runs,
-and fifteen exceed it outright. Operators with sustained same-circuit
-volume (relayers, delegated provers, tree-maintenance services) may hold 50
-or more same-key proofs before broadcast and today can only pay the full
-price 50 times, avoidable load on every validator.
+Solana verifies zero-knowledge proofs one at a time. A one-input Groth16
+proof costs about 96k CU on the uncommitted rail and 231k CU on the
+committed rail. Transactions in the authors' privacy pool commonly compose
+two or three proofs and may contain five. Operators with sustained
+same-circuit volume (relayers, delegated provers, tree-maintenance services)
+may hold 50 or more same-key proofs before broadcast and today can only pay
+the full price.
 High compute cost has already been an underlying problem for the network
 at least once.
 
 Almost none of that cost is cryptographically necessary. Batch verification
 is a standard technique (Bellare-Garay-Rabin 1998): weight each verification
 equation by a random 128-bit scalar and check the product of the weighted
-equations at once, with soundness error $2^{-128}$ per equation. The
-randomizers fold into the G1 side by bilinearity, so the fold itself is G1
-MSMs and scalar multiples. For $n$ Groth16 proofs under one verifying key
-the whole batch collapses to $n+3$ pairing terms under a single final
-exponentiation: one MSM per fixed-G2 term ($\beta$, $\gamma$, $\delta$)
-plus one $[r_i]A_i$ multiple per proof term. A PLONK/KZG batch collapses
-to two pairing terms for any $n$, fed by two MSMs. The per-proof marginal
-cost falls from a full verification to at most one pairing term plus a few
-MSM points.
+equations at once, with soundness error $2^{-128}$ per equation.
 
 The current syscall surface cannot express this. Two pieces are missing:
 
-1. **No G1 MSM.** The batch fold is multi-scalar multiplication; today it
+1. **No G1 MSM.** The batch fold is multi-scalar multiplication. Today it
    costs $n$ separate `alt_bn128_multiplication` calls at 3,840 CU each plus
    sBPF additions, forfeiting the Pippenger speedup that makes folding cheap.
 2. **No scalar-field arithmetic.** PLONK's verifier is dominated by Fr work:
    150 to 300 multiplications and several inversions per proof for challenge
    derivation, Lagrange evaluation, and opening folds. One Fr multiply is
    about 1 CU native but 150 to 250 CU in sBPF, which has no 64x64 to 128
-   multiply; one inversion is hundreds of multiplies.
+   multiply. One inversion is hundreds of multiplies.
 
-Closing two gaps effectively takes four syscalls. The MSM is the main one.
-The Fr work is two orthogonal primitives, an inner product and a batch
-inverse, the narrowest surface covering the verifier's whole field cost (a
-programmable field VM was considered and rejected as unpriceable; see
-Alternatives Considered). The fourth, `sol_alt_bn128_pairing_check`, is a
-new syscall computing the same boolean pairing-product check the chain
-already has as the `ALT_BN128_PAIRING` operation of
-`sol_alt_bn128_group_op`. Three facts about that operation disqualify it as
-the anchor of a batch verifier. It accepts an empty input vacuously: zero
-pairs parse to an empty multi-pairing, whose product is the identity, so it
-returns true, a soundness landmine when the input is a folded batch. Its
-byte-buffer length handling is the bug SIMD-0334 fixed. And it is priced
-`36,364 + 12,121 * (n - 1)` CU, constants fitted to an older backend:
-666,656 CU for the 53 pairs of a 50-proof batch, where this proposal's
-model charges 508k. Each could be patched behind its own feature gate, as
-SIMD-0334 was, but the batch path also needs the typed count-based ABI and
-the pair cap of the Detailed Design; one new syscall delivers all of it on
-the same feature gate as the MSM, and the activated operation keeps its
-semantics.
+Closing two gaps takes four syscalls. The MSM is the main one. The Fr part
+is an inner product and a batch inverse, the narrowest surface covering
+the verifier's whole field cost.
+
+The fourth, `sol_alt_bn128_pairing_check`, is a new syscall computing the
+same boolean pairing-product check the chain already has as the
+`ALT_BN128_PAIRING` operation of `sol_alt_bn128_group_op`. Three facts
+about that operation disqualify it as the anchor of a batch verifier:
+
+- It accepts an empty input: zero pairs parse to an empty multi-pairing,
+  whose product is the identity, so it returns true, a soundness landmine
+  when the input is a folded batch.
+- Its byte-buffer length handling is the bug SIMD-0334 fixed.
+- It is priced `36,364 + 12,121 * (n - 1)` CU, constants fitted to an
+  older backend: 666,656 CU for the 53 pairs of a 50-proof batch, where
+  this proposal's model charges 508k.
+
+Each could be patched behind its own feature gate, as SIMD-0334 was, but
+the batch path also needs the typed count-based ABI and the pair cap of
+the Detailed Design. One new syscall delivers all of it on the same
+feature gate as the MSM, and the activated operation keeps its semantics.
 
 The design is implementation-tested. The four syscalls plus the reference
-Groth16 and PLONK batch verifiers were built five times over interchangeable
-backends on one wire contract: stock arkworks, an optimized arkworks, mcl,
-and a pure-Rust backend with and without an 8-wide AVX-512 IFMA pairing path.
-All five were benchmarked in one pinned campaign on validator-class x86, and
-each backend's fit of the cost model (linear bases, a log2-bucketed MSM
-discount) upper-bounds its measured CU at every grid size. For any client
-implementation the constants are a re-fit, not a redesign.
+Groth16 and PLONK batch verifiers were built five times over
+interchangeable backends on one wire contract and benchmarked on
+validator-class hardware.
 
 ## Dependencies
 
@@ -108,7 +91,7 @@ are new symbols that layer on the long-activated alt_bn128 family only
 through its byte encoding and test vectors, and they activate alone under
 one feature gate.
 
-Relationship to adjacent proposals:
+Relationship to other proposals:
 
 - **[SIMD-0129] (activated):** the new syscalls follow its error convention,
   a single non-fatal `Ok(1)` for any domain error, hard aborts reserved for
@@ -116,9 +99,9 @@ Relationship to adjacent proposals:
   established convention, not a dependency.
 - **[SIMD-0284] (little-endian encoding, proposed):** orthogonal. These
   syscalls are big-endian only, matching the existing pairing and the proof
-  toolchain (gnark, snarkjs, circom, arkworks); 0284's little-endian
-  variants live on the group-op syscall and neither proposal constrains the
-  other.
+  toolchain (gnark, snarkjs, circom, arkworks). 0284's little-endian
+  variants live on the group-op syscall and neither proposal constrains
+  the other.
 - **SIMD-0302 (G2 arithmetic): explicitly not required.** By bilinearity
   every randomizer folds into the G1 side, so the batch fold is a G1 MSM and
   the only G2 elements a verifier touches are the fixed verifying-key
@@ -136,8 +119,7 @@ Relationship to adjacent proposals:
   produces one short proof at the cost of new setup material or a proving
   service.
 - **Randomizer.** A per-equation scalar $r_k$ drawn from the batch's
-  Fiat-Shamir challenge, uniform on $[1, 2^{128}]$. The batch accepts iff the
-  randomized product of per-proof error terms is the group identity.
+  Fiat-Shamir challenge, uniform on $[1, 2^{128}]$.
 - **Small-exponents test.** The Bellare-Garay-Rabin (1998) construction:
   accept iff $\prod_k E_k^{r_k} = 1$. A failed equation survives with
   probability at most $2^{-128}$ per equation, information-theoretic given a
@@ -153,10 +135,9 @@ Relationship to adjacent proposals:
 
 ## Detailed Design
 
-Four syscalls in two groups: two group operations feeding the pairing check,
+Four syscalls in two groups: two group operations for the pairing check,
 and two scalar-field helpers for the arithmetic between them. Validation is a
-function of the argument type, never a caller flag. Every G2 argument is raw
-and fully validated.
+function of the argument type. Every G2 argument is raw and fully checked.
 
 ```text
 alt_bn128_g1_msm(points: &[G1], scalars: &[Scalar]) -> G1
@@ -168,9 +149,9 @@ alt_bn128_fr_batch_invert(a: &[Scalar]) -> [Scalar]
 `pairing_check` runs one multi-Miller loop and one final exponentiation, keeps
 the Fq12 internal, compares to the identity, and returns a boolean word.
 `g1_msm` returns one G1 point. `fr_lincomb` returns
-$\sum_i a_i b_i \bmod q$, reduced once at the end, the linearization fold
-and the batched-opening combination in one call over two equal-length
-scalar arrays.
+$\sum_i a_i b_i \bmod q$ over two equal-length scalar arrays, reduced once
+at the end, the linearization fold and the batched-opening combination in
+one call.
 `fr_batch_invert` returns the inverse of every input scalar with Montgomery's
 trick, one field inversion and $3(n-1)$ muls for $n$ inputs, covering
 Lagrange-basis evaluation and every division. Both scalar-field syscalls touch
@@ -184,14 +165,12 @@ G1, 128-byte G2, 32-byte scalar, 192-byte G1-then-G2 pair, byte-aligned
 arrays throughout. The runtime translates every array as count times element
 size with checked arithmetic and charges compute from the same count, so the
 size charged, the size translated, and the size parsed are one number.
-Results are typed records of exact size (a G1 point, the 32-byte verdict
-word, or count scalars); no byte length appears anywhere in the interface.
-This departs from `sol_alt_bn128_group_op`, which takes an opaque buffer
+Results are typed fixed-size records (a G1 point, the 32-byte verdict
+word, or count scalars). No byte length appears anywhere in the interface.
+This is distinct from `sol_alt_bn128_group_op`, which takes an opaque buffer
 plus an operation ID and re-derives per-operation sizes internally, the
 design SIMD-0222 and SIMD-0334 had to correct: with typed counts a truncated
-element or a charged-versus-parsed size mismatch cannot be expressed. The
-types carry layout only; the validation below is the sole path from bytes to
-a group element or scalar.
+element or a charged-versus-parsed size mismatch cannot be expressed.
 
 ### Encoding
 
@@ -200,10 +179,10 @@ including the Fq2 limb order. G1 is 64 bytes (x then y), G2 is 128 bytes
 (x.c1, x.c0, y.c1, y.c0), a pair is 192 bytes, a scalar is 32 bytes.
 All-zeros is the point at infinity. An implementation MUST reuse the existing
 alt_bn128 test vectors to pin the layout, so proofs from gnark, snarkjs,
-circom, and arkworks need no conversion. The syscall MUST NOT accept or return a
-compressed point, a prepared (line-coefficient) G2, or an Fq12 target-group
-element. The scalar-field syscalls consume and produce the same 32-byte
-big-endian canonical scalars (value $< q$).
+circom, and arkworks need no conversion. The syscall MUST NOT accept or
+return a compressed point, a prepared (line-coefficient) G2, or an Fq12
+target-group element. The scalar-field syscalls consume and produce the
+same 32-byte big-endian canonical scalars (value $< q$).
 
 ### Validation
 
@@ -216,13 +195,11 @@ inputs, first failure returning its error:
 | G2     | length 128, Fq2 limbs canonical, on-curve, subgroup member  |
 | Scalar | length 32, value $< q$                                      |
 
-G1 has cofactor 1, so on-curve implies subgroup membership; G2's cofactor is
-near $2^{254}$, so its subgroup membership MUST be checked per point, via
-the fast endomorphism test. `fr_batch_invert` additionally rejects a zero scalar
-(`ZeroInput`), since its inverse is undefined; `fr_lincomb` accepts zeros and
-rejects unequal-length arrays (`LengthMismatch`). Compute is charged up front
-from the declared input sizes, so malformed input consumes the same CU as
-valid input and validation order leaks nothing through the meter.
+G1 has cofactor 1, so on-curve implies subgroup membership. G2's cofactor
+is near $2^{254}$, so its subgroup membership MUST be checked per point,
+via the fast endomorphism test. `fr_batch_invert` also rejects a zero
+scalar (`ZeroInput`), since its inverse is undefined. `fr_lincomb` accepts
+zeros and rejects unequal-length arrays (`LengthMismatch`).
 
 ### Errors
 
@@ -236,7 +213,7 @@ and compute-budget exhaustion.
 
 `pairing_check` accepts at most 256 pairs per call, `g1_msm` at most 2048
 points, and each scalar-field syscall at most 2048 scalars per array. All are
-memory and griefing bounds; the compute budget binds first in practice.
+memory and griefing bounds.
 
 ### Pricing
 
@@ -251,13 +228,13 @@ entry per log2 bucket over $n = 1$ to $2048$, each fitted as an upper bound
 of measured CU plus margin, so the model never undercharges a measured
 size.
 
-The model is backend-independent; the constants are not. Every client
+The model is backend-independent while the constants are not. Every client
 charges the same CU regardless of which arithmetic backend it runs, so the
 constants MUST be fitted as an upper bound to the slowest backend any
 conforming client ships at activation, and a faster backend lowers charges
 only through a subsequent re-pricing feature gate. The backend that ships
-at activation is the tuned arkworks, so the reference constants below are
-its fit at the x86-64-v2 shipping profile (Zen 4, 33 ns per CU); the
+at activation is arkworks, so the reference constants below are its fit at
+the x86-64-v2 shipping profile (Zen 4, 33 ns per CU). The
 authors' pure-Rust backend is audit-gated and, once audited, lowers these
 charges through that re-pricing path (last table row):
 
@@ -269,36 +246,19 @@ fr_lincomb base 100, per_term 1
 fr_batch_invert base 100, per_term 3
 ```
 
-All five candidate backends were fitted in one pinned campaign on
-validator-class x86 (AMD EPYC 9354, identical harness and seeds).
-Kernel-level cross-checks on Intel Granite Rapids run the same pairing
-kernels about 24% faster than Zen 4, so constants fitted on the AMD box
-upper-bound current Intel validator silicon as well. The fit
-spread, and what it does to batched Groth16 verification, is tabulated
-below. All values are CU at the 33 ns per CU convention: `per_pair` and
-`per_point` are that backend's fitted constants (the charged pair cost
-adds the `g2_subgroup` component on top of `per_pair`). The 5- and
-50-proof columns are the exact totals the reference fold is charged for a
-vanilla (uncommitted) Groth16 batch of that size, same verifying key, one
-public input: one $(n+3)$-pair check, $n$ one-point $[r_i]A_i$
-multiplications, the three fixed-G2-term MSMs, and the input-folding
-`fr_lincomb`. Parenthesized is the multiple against $n$ individual Groth16
-verifies at 96k CU each. PLONK
-batches, whose cost is dominated by one MSM rather than the pair count,
-are costed in Impact:
-
 | Backend fit    | per_pair | per_point | 5-proof CU     | 50-proof CU     |
 |----------------|----------|-----------|----------------|-----------------|
-| arkworks stock | 7,230    | 4,273     | 153,544 (3.1x) | 913,032 (5.3x)  |
-| arkworks tuned | 4,742    | 1,790     | 110,652 (4.3x) | 638,648 (7.5x)  |
-| mcl            | 3,357    | 1,225     | 84,695 (5.7x)  | 519,517 (9.2x)  |
+| arkworks       | 4,742    | 1,790     | 110,652 (4.3x) | 638,648 (7.5x)  |
 | helios (gated) | 1,567    | 1,126     | 64,024 (7.5x)  | 366,317 (13.1x) |
 
-The tuned-arkworks row is the shipped default; the helios row is what the
-post-audit re-pricing gate reaches without any change to this design.
+The 5- and 50-proof columns are the reference-fold charges for a vanilla
+one-key Groth16 batch. Parenthesized is the multiple over $n$ individual
+96k-CU verifies. The arkworks row is the shipped default. The helios row
+is what the post-audit re-pricing gate reaches without any change to this
+design.
 
 The scalar-field syscalls are priced linearly in the array length,
-`base + per_term * n`; `fr_batch_invert`'s base also covers the single
+`base + per_term * n`. `fr_batch_invert`'s base also covers the single
 field inversion the whole batch shares. Each constant is a strict upper
 bound of measured CU at every grid point
 $n \in \{1, 16, 64, 256, 1024, 2048\}$. Native Fr
@@ -314,7 +274,7 @@ $\prod_k E_k = 1$, is broken: two invalid proofs whose error terms are
 $g^a$ and $g^{-a}$ both pass. The fix is a challenge: draw randomizers
 $r_k$ and accept iff $\prod_k E_k^{r_k} = 1$. If some $E_j$ is not $1$, a
 uniform $r_j$ from $2^{128}$ values satisfies the resulting linear
-equation with probability at most $2^{-128}$ (Bellare-Garay-Rabin).
+equation with probability at most $2^{-128}$.
 Randomizers attach to equations, not proofs: a committed proof's Groth16
 relation and its Pedersen proof of knowledge each get their own randomizer.
 
@@ -345,11 +305,11 @@ r_k  = 1 + lo128( keccak256( seed || be64(k) ) )   for k = 1..N
 
 `com_i` and `pok_i` are present iff key `vk_i` is committed. `vkd_j` is
 keccak256 over key j's canonical bytes. $N$ is the number of verification
-equations, $n$ plus one more per committed proof. `lo128` takes the digest's
-last 16 bytes big-endian, and `1 + lo128(.)` is uniform on $[1, 2^{128}]$,
-no zero and no bias. The per-record key index binds each proof to its
-circuit and fixes the record layout. Omitting any field reopens a
-weak-Fiat-Shamir attack.
+equations, $n$ plus one more per committed proof. `lo128` takes the
+digest's last 16 bytes big-endian, and `1 + lo128(.)` is uniform on
+$[1, 2^{128}]$, no zero and no bias. The per-record key index binds each
+proof to its circuit and fixes the record layout. Omitting any field
+reopens a weak-Fiat-Shamir attack.
 `domain_tag` is a versioned ASCII constant carrying the protocol name,
 transcript version, and randomizer mode, distinct per scheme.
 
@@ -401,16 +361,16 @@ transcript version, and randomizer mode, distinct per scheme.
 - **Returning the target-group element** (as the starting-point
   prepared-pairing syscall did) instead of a boolean. Every batch input is
   public, so an attacker can compute the pre-final-exponentiation product
-  $M$ and inject $M^{-1}$; the check computes identity and accepts, with
+  $M$ and inject $M^{-1}$. The check computes identity and accepts, with
   no hard problem. Returning a boolean removes this codomain value from
   the boundary.
 - **Accepting prepared (line-coefficient) G2** from instruction data.
   Coefficients that correspond to no real point make the pairing evaluate to
   an attacker-chosen value. Preparation happens inside the runtime, after
-  validation, from raw bytes; nothing prepared crosses the boundary.
+  validation, from raw bytes. Nothing prepared crosses the boundary.
 - **Powers of one challenge** ($r_k = r^{k-1}$) instead of independent
   randomizers. Powers need one draw but give an $N-1$ factor in the soundness
-  error. Independent randomizers are the default; the powers variant is
+  error. Independent randomizers are the default. The powers variant is
   allowed where a caller wants the cheaper derivation.
 - **A generic curve-ID family** in the SIMD-0388 style
   (`sol_curve_pairing_map` with a curve ID) instead of a dedicated
@@ -421,18 +381,18 @@ transcript version, and randomizer mode, distinct per scheme.
   stream over the scalar field) instead of the two fixed scalar-field
   primitives. It would cover more but is hard to price honestly and hard to
   make total, and the two Fr primitives already capture the verifier's whole
-  scalar-field cost (the linearization fold and the batch inversion). Rejected
-  for the same reason the pairing returns a boolean, not a programmable
-  target: a narrow priceable surface over a wide one.
+  scalar-field cost. Rejected for the same reason the pairing returns a
+  boolean, not a programmable target: a narrow priceable surface over a
+  wide one.
 
 ## Impact
 
 For programs that verify Groth16 or PLONK proofs, per-proof cost drops
 severalfold at the shipped constants and reaches an order of magnitude
-after the audit-gated re-pricing. Under the shipped (tuned-arkworks)
-constants five same-key Groth16 proofs charge about 111k CU against 480k
-for five independent verifies (4.3x), and 50 charge about 639k against
-4.8M (7.5x, rising to 13.1x under the helios fit; see Pricing); the
+after the audit-gated re-pricing. At the shipped constants five same-key
+Groth16 proofs charge about 111k CU against 480k for five independent
+verifies (4.3x), and 50 charge about 639k against 4.8M (7.5x, 13.1x under
+the helios fit). The
 committed (BSB22) rail starts from 231k CU per individual verify and
 batches at $n+5$ pairing terms, so its multiple is larger still. A 50-proof
 PLONK batch draws about 310k CU in syscall charges, 6.2k per proof: all of
@@ -440,12 +400,11 @@ a PLONK proof's per-proof data is G1 and Fr and folds into the two batch
 MSMs with no per-proof pairing term. That syscall figure is not the whole
 cost. Each proof also pays five to six per-proof Fiat-Shamir derivations
 and the reduction's chained products, some fifty Fr multiplications that no
-inner-product syscall can absorb, roughly 8 to 14k CU of sBPF arithmetic;
-and a PLONK proof is near three times a Groth16 proof's bytes (about 800
-against 288 uncompressed, with one input) against the 1,232-byte
-transaction. End to end, a batched PLONK proof therefore lands at parity
-with or above a batched Groth16 proof. The syscalls' effect on PLONK is
-different in kind:
+inner-product syscall can absorb, roughly 8 to 14k CU of sBPF arithmetic.
+A PLONK proof is also near three times a Groth16 proof's bytes (about 800
+against 288 uncompressed, one input) against the 1,232-byte transaction.
+End to end, a batched PLONK proof therefore lands at parity with or above
+a batched Groth16 proof. The syscalls' effect on PLONK is different in kind:
 without `fr_lincomb` and `fr_batch_invert` the reduction alone would carry
 roughly 25k CU per proof of sBPF field arithmetic, which is what makes
 batched PLONK impractical today. Batch sizes are bounded by compute before
@@ -463,79 +422,50 @@ transcript and are never dependent on an SDK function for soundness.
 
 ## Security Considerations
 
-Every requirement below is either consensus behavior of the four syscalls
-or a normative requirement on the batch reference, and each carries a
-REQUIRED negative vector in the Conformance suite.
+The syscalls enforce everything caller-independent. Every input passes
+the fixed validation order of Detailed Design, including per-point G2
+subgroup membership and canonical encodings: a non-subgroup element voids
+the prime-order hypothesis behind the $2^{-128}$ bound, and a
+non-canonical limb or scalar gives two byte strings for one value, free
+grinding bits for any byte-keyed transcript. Empty input errors rather
+than vacuously accepting, `fr_batch_invert` rejects zero rather than
+corrupt a Lagrange evaluation, no Fq12 and nothing prepared crosses the
+boundary (see Alternatives Considered), and compute is charged up front
+so the meter is not an oracle and an underpriced pairing cannot become a
+CPU-exhaustion primitive. All four syscalls are total. A panic or
+divergence on any input is a consensus fault, and the scalar-field pair
+MUST agree bit-exactly with a reference field implementation. The
+arithmetic itself is not new: the shipped backend is the same arkworks
+BN254 stack behind the deployed alt_bn128 syscalls and much of the
+production SNARK toolchain.
 
-Enforced by the syscalls, independent of the caller:
+The reference batch verifier REQUIRES the full Fiat-Shamir transcript of
+The Batch Check: the challenge hashes the complete frozen batch in
+canonical bytes with fixed-width framing, and `1 + lo128(.)` keeps
+randomizers 128-bit and nonzero. Every shortcut is a known break. No
+randomizers: +D / -D error terms on two C points cancel and two invalid
+proofs pass. Any omitted transcript field: a weak-Fiat-Shamir attack.
+64-bit randomizers: offline grinding once the random-oracle query factor
+multiplies in. A zero randomizer: an equation silently dropped.
 
-- **G2 subgroup membership, per point.** G2's cofactor is near $2^{254}$,
-  so on-curve says nothing about subgroup membership, and one non-subgroup
-  element voids the prime-order hypothesis the $2^{-128}$ bound rests on.
-  Checked and priced per point; skipping or batching the check is unsound
-  by default.
-- **Canonical encodings.** A limb at or above $p$ or a scalar at or above
-  $q$ gives two byte strings for one value, handing any byte-keyed
-  transcript free grinding bits. Rejected before any arithmetic.
-- **A boolean verdict and nothing else.** No Fq12 crosses the boundary in
-  either direction and nothing prepared is accepted: a returned target
-  element invites the $M^{-1}$ injection, and prepared line coefficients
-  can encode no real point (see Alternatives Considered). The ABI test
-  asserts the absence of both.
-- **No vacuous accept.** Zero pairs, zero points, and empty scalar arrays
-  are errors, never the empty product; the deployed pairing operation
-  returns true on empty input, and these syscalls MUST NOT.
-  `fr_batch_invert` likewise rejects a zero scalar rather than return a
-  bogus inverse that would corrupt a Lagrange evaluation an attacker
-  steering a public input could reach.
-- **Up-front pricing.** An underpriced pairing is the cheapest
-  CPU-exhaustion primitive on the chain, and a meter that varies with
-  content is an oracle. Compute is charged from declared counts before any
-  work, and the MSM discount never undercharges a measured size.
-- **Totality.** Any input on which a client panics, loops, or diverges is
-  a consensus fault. All four syscalls are total, with bit-exact results
-  across clients; the scalar-field pair carries no soundness weight of its
-  own, only the requirement of exact agreement with a reference field
-  implementation.
+Implementations that batch over these syscalls without the reference
+transcript can break this way, as deployed verifiers repeatedly have
+(Dao-Miller-Wright-Grubbs 2023 catalogued 36 weak-Fiat-Shamir
+implementations). The transcript is the soundness, and the syscalls
+cannot check it.
 
-Specified normatively for the batch layer, where the runtime cannot check
-the caller:
-
-- **The challenge is the soundness.** Without randomizers, $+D$ / $-D$
-  error terms on two proofs' C points cancel and the batch accepts two
-  invalid proofs. The challenge MUST hash the complete frozen batch in
-  canonical bytes with fixed-width framing; omitting proof bytes, public
-  inputs, VK digests, counts, order, the per-record key index, or the
-  domain tag each reopens a weak-Fiat-Shamir attack.
-- **128-bit randomizers, never zero.** $\ell = 64$ is grindable offline
-  once the random-oracle query factor multiplies in, and a zero randomizer
-  silently drops an equation; `1 + lo128(.)` makes both unreachable.
-  Randomizers attach to verification equations, not proofs.
+Each requirement above carries a REQUIRED negative vector in Conformance.
 
 ## Drawbacks
 
-- **Curve margin.** BN254 sits near 100-bit security after exTNFS, below
-  the 128-bit target the ecosystem is moving toward (SIMD-0388 proposes
-  BLS12-381 partly for this reason). It remains the compatibility choice,
-  the curve snarkjs, circom, and gnark target and the deployed syscalls
-  speak, and the interface stays curve-generic so a stronger instantiation
-  is additive, not a redesign.
-- **The batch layer is a specification, not a runtime check.** The
-  syscalls enforce everything caller-independent; the challenge derivation
-  is the caller's, and a program that ignores the normative reference can
-  build an unsound batch from sound primitives. That is the deliberate
-  price of four general primitives over a monolithic precompile
-  (Alternatives Considered), paid once in the reference and its vectors.
-- **All-or-nothing verdict.** One invalid proof fails the whole batch. In
-  open submission the operator needs attribution, bisection or a deposit
-  scheme, and that machinery is the integrator's, not this proposal's.
-- **Random-oracle soundness.** The $2^{-128}$ bound is a random-oracle
-  statement and inherits the grinding-query factor stated in Detailed
-  Design; at 128-bit randomizers the factor is academic.
-- **Governance surface.** Four new syscalls, their cost constants, and a
-  re-pricing path: constants are fitted to the shipping backend and move
-  only by feature gate, so a faster audited backend pays a governance
-  round-trip before charges drop.
+BN254's roughly 100-bit security margin is below the 128-bit target the
+ecosystem is moving toward (SIMD-0388 proposes BLS12-381 partly for this
+reason).
+The batch layer's soundness is a random-oracle statement, so it inherits the
+grinding-query factor stated in Detailed Design. At 128-bit randomizers the
+factor is academic. A batch is all-or-nothing, so one invalid proof fails the
+whole check, which in open submission requires an attribution and deposit
+scheme that is the integrator's responsibility.
 
 ## Backwards Compatibility
 
@@ -552,12 +482,11 @@ Clients verify correctness against a shared vector suite. The change is
 accompanied by a localnet ledger demonstrating behavior before activation, the
 feature activation, and the four syscalls executing after activation. The
 suite MUST include: the existing alt_bn128 test vectors (pinning the byte
-layout), a positive vector per rail (uncommitted and committed) checked
-against the individual verifier byte for byte, scalar-field vectors (a
-`fr_lincomb` cross-checked against a reference inner product, a
-`fr_batch_invert` cross-checked against per-element inversion, an
-unequal-length pair, and a zero fed to `fr_batch_invert`), and one
-negative vector per Security
+layout), a positive vector per rail checked against
+the individual verifier byte for byte, scalar-field vectors (a `fr_lincomb`
+cross-checked against a reference inner product, a `fr_batch_invert`
+cross-checked against per-element inversion, an unequal-length pair, and a
+zero fed to `fr_batch_invert`), and one negative vector per Security
 Considerations item (off-curve, non-subgroup G2 at every position, the
 cancelling out-of-subgroup pair, non-canonical limbs and scalars, infinity
 handling, zero and cap errors, and the absence of any Fq12 or prepared slot).

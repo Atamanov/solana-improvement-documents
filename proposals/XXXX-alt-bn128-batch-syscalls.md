@@ -35,16 +35,16 @@ Zero-knowledge proofs on Solana are verified one at a time, and verification
 dominates the cost of every ZK application. A single Groth16 verification
 measures about 96k CU on the uncommitted rail (one public input) and 231k
 CU on the committed rail against the current syscalls. Real transactions
-carry more than one proof: in the authors' privacy pool deployment a swap
-composes a
-program rule proof with the pool's transact proof and a policy proof, two or
-three proofs per transaction the common case and five in at least one of the
-use cases. Independent verification scales linearly and hits the ceiling
-fast: five proofs burn a third of the 1.4M CU transaction cap before any
-state effect runs, and fourteen exhaust it outright. Operators with sustained
-same-circuit volume (relayers, delegated provers, tree-maintenance services)
-may hold 50 or more same-key proofs before broadcast and today can only pay
-the full price 50 times, avoidable load on every validator.
+carry more than one proof, composed like CPI depth: in the authors' privacy
+pool deployment a swap's rule proof calls into the pool's transact proof,
+and a policy ring inserts a third hop; two or three proofs per transaction
+is the common case, five the composability ceiling. Independent
+verification scales linearly and hits the compute ceiling fast: five proofs
+burn a third of the 1.4M CU transaction cap before any state effect runs,
+and fifteen exceed it outright. Operators with sustained same-circuit
+volume (relayers, delegated provers, tree-maintenance services) may hold 50
+or more same-key proofs before broadcast and today can only pay the full
+price 50 times, avoidable load on every validator.
 High compute cost has already been an underlying problem for the network
 at least once.
 
@@ -97,8 +97,8 @@ Groth16 and PLONK batch verifiers were built five times over interchangeable
 backends on one wire contract: stock arkworks, an optimized arkworks, mcl,
 and a pure-Rust backend with and without an 8-wide AVX-512 IFMA pairing path.
 All five were benchmarked in one pinned campaign on validator-class x86, and
-the cost model (linear bases, a log2-bucketed MSM discount) upper-bounds
-measured CU on every backend at every grid size. For any client
+each backend's fit of the cost model (linear bases, a log2-bucketed MSM
+discount) upper-bounds its measured CU at every grid size. For any client
 implementation the constants are a re-fit, not a redesign.
 
 ## Dependencies
@@ -114,10 +114,11 @@ Relationship to adjacent proposals:
   a single non-fatal `Ok(1)` for any domain error, hard aborts reserved for
   memory faults and budget exhaustion. This is conformance to the
   established convention, not a dependency.
-- **[SIMD-0284] (little-endian encoding, in progress):** orthogonal. These
+- **[SIMD-0284] (little-endian encoding, proposed):** orthogonal. These
   syscalls are big-endian only, matching the existing pairing and the proof
-  toolchain (snarkjs, circom, arkworks); 0284's little-endian variants live
-  on the group-op syscall and neither proposal constrains the other.
+  toolchain (gnark, snarkjs, circom, arkworks); 0284's little-endian
+  variants live on the group-op syscall and neither proposal constrains the
+  other.
 - **SIMD-0302 (G2 arithmetic): explicitly not required.** By bilinearity
   every randomizer folds into the G1 side, so the batch fold is a G1 MSM and
   the only G2 elements a verifier touches are the fixed verifying-key
@@ -198,8 +199,8 @@ Byte-for-byte the encoding of the existing pairing syscall: big-endian,
 including the Fq2 limb order. G1 is 64 bytes (x then y), G2 is 128 bytes
 (x.c1, x.c0, y.c1, y.c0), a pair is 192 bytes, a scalar is 32 bytes.
 All-zeros is the point at infinity. An implementation MUST reuse the existing
-alt_bn128 test vectors to pin the layout, so proofs from snarkjs, circom, and
-arkworks need no conversion. The syscall MUST NOT accept or return a
+alt_bn128 test vectors to pin the layout, so proofs from gnark, snarkjs,
+circom, and arkworks need no conversion. The syscall MUST NOT accept or return a
 compressed point, a prepared (line-coefficient) G2, or an Fq12 target-group
 element. The scalar-field syscalls consume and produce the same 32-byte
 big-endian canonical scalars (value $< q$).
@@ -270,19 +271,19 @@ fr_batch_invert base 100, per_term 3
 
 All five candidate backends were fitted in one pinned campaign on
 validator-class x86 (AMD EPYC 9354, identical harness and seeds).
-Kernel-level cross-checks on Intel Granite Rapids (Xeon 6767P) run the same
-pairing about 24% faster than the Zen 4 fit box, so constants fitted on the
-AMD box upper-bound current Intel validator silicon as well. The fit
+Kernel-level cross-checks on Intel Granite Rapids run the same pairing
+kernels about 24% faster than Zen 4, so constants fitted on the AMD box
+upper-bound current Intel validator silicon as well. The fit
 spread, and what it does to batched Groth16 verification, is tabulated
 below. All values are CU at the 33 ns per CU convention: `per_pair` and
 `per_point` are that backend's fitted constants (the charged pair cost
 adds the `g2_subgroup` component on top of `per_pair`). The 5- and
 50-proof columns are the exact totals the reference fold is charged for a
-vanilla (uncommitted) Groth16 batch of
-that size, same verifying key, one public input: one $(n+3)$-pair check,
-$n$ one-point $[r_i]A_i$ multiplications, the $\alpha$, $\gamma$, and
-$\delta$ MSMs, and the input-folding `fr_lincomb`. Parenthesized is the
-multiple against $n$ individual Groth16 verifies at 96k CU each. PLONK
+vanilla (uncommitted) Groth16 batch of that size, same verifying key, one
+public input: one $(n+3)$-pair check, $n$ one-point $[r_i]A_i$
+multiplications, the three fixed-G2-term MSMs, and the input-folding
+`fr_lincomb`. Parenthesized is the multiple against $n$ individual Groth16
+verifies at 96k CU each. PLONK
 batches, whose cost is dominated by one MSM rather than the pair count,
 are costed in Impact:
 
@@ -343,11 +344,12 @@ r_k  = 1 + lo128( keccak256( seed || be64(k) ) )   for k = 1..N
 ```
 
 `com_i` and `pok_i` are present iff key `vk_i` is committed. `vkd_j` is
-keccak256 over key j's canonical bytes. `lo128` takes the digest's last 16
-bytes big-endian, and `1 + lo128(.)` is uniform on $[1, 2^{128}]$, no zero
-and no bias. The per-record key index binds each proof to its circuit and
-fixes the
-record layout. Omitting any field reopens a weak-Fiat-Shamir attack.
+keccak256 over key j's canonical bytes. $N$ is the number of verification
+equations, $n$ plus one more per committed proof. `lo128` takes the digest's
+last 16 bytes big-endian, and `1 + lo128(.)` is uniform on $[1, 2^{128}]$,
+no zero and no bias. The per-record key index binds each proof to its
+circuit and fixes the record layout. Omitting any field reopens a
+weak-Fiat-Shamir attack.
 `domain_tag` is a versioned ASCII constant carrying the protocol name,
 transcript version, and randomizer mode, distinct per scheme.
 
@@ -440,9 +442,10 @@ cost. Each proof also pays five to six per-proof Fiat-Shamir derivations
 and the reduction's chained products, some fifty Fr multiplications that no
 inner-product syscall can absorb, roughly 8 to 14k CU of sBPF arithmetic;
 and a PLONK proof is near three times a Groth16 proof's bytes (about 800
-against 288 with one input) against the 1,232-byte transaction. End to
-end, a batched PLONK proof therefore lands at parity with or above a
-batched Groth16 proof. The syscalls' effect on PLONK is different in kind:
+against 288 uncompressed, with one input) against the 1,232-byte
+transaction. End to end, a batched PLONK proof therefore lands at parity
+with or above a batched Groth16 proof. The syscalls' effect on PLONK is
+different in kind:
 without `fr_lincomb` and `fr_batch_invert` the reduction alone would carry
 roughly 25k CU per proof of sBPF field arithmetic, which is what makes
 batched PLONK impractical today. Batch sizes are bounded by compute before
@@ -512,7 +515,7 @@ the caller:
 ## Drawbacks
 
 - **Curve margin.** BN254 sits near 100-bit security after exTNFS, below
-  the 128-bit target the ecosystem is moving toward (SIMD-0388 ships
+  the 128-bit target the ecosystem is moving toward (SIMD-0388 proposes
   BLS12-381 partly for this reason). It remains the compatibility choice,
   the curve snarkjs, circom, and gnark target and the deployed syscalls
   speak, and the interface stays curve-generic so a stronger instantiation
@@ -551,10 +554,10 @@ feature activation, and the four syscalls executing after activation. The
 suite MUST include: the existing alt_bn128 test vectors (pinning the byte
 layout), a positive vector per rail (uncommitted and committed) checked
 against the individual verifier byte for byte, scalar-field vectors (a
-`fr_lincomb`
-cross-checked against a reference inner product, a `fr_batch_invert`
-cross-checked against per-element inversion, an unequal-length pair, and a
-zero fed to `fr_batch_invert`), and one negative vector per Security
+`fr_lincomb` cross-checked against a reference inner product, a
+`fr_batch_invert` cross-checked against per-element inversion, an
+unequal-length pair, and a zero fed to `fr_batch_invert`), and one
+negative vector per Security
 Considerations item (off-curve, non-subgroup G2 at every position, the
 cancelling out-of-subgroup pair, non-canonical limbs and scalars, infinity
 handling, zero and cap errors, and the absence of any Fq12 or prepared slot).

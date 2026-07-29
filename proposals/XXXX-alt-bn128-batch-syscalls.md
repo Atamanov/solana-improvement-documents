@@ -313,6 +313,52 @@ reopens a weak-Fiat-Shamir attack.
 `domain_tag` is a versioned ASCII constant carrying the protocol name,
 transcript version, and randomizer mode, distinct per scheme.
 
+### The PLONK Reduction
+
+The reference batched PLONK (KZG) verifier splits Fiat-Shamir in two. Inner
+challenges (beta, gamma, alpha, zeta, v, u) are proof-local: each derives
+from a phased transcript over that proof alone (domain tag, key digest,
+statement, commitments in round order), so a proof's challenges are
+identical alone or in any batch. Outer randomizers rho_i come from the
+batch seed of The Batch Check. This split is what makes a PLONK proof
+batchable at all: the verifier reduces each proof to scalar coefficients
+on a shared G1 basis, so the whole batch is
+
+- one `fr_batch_invert` over every proof's Lagrange denominators,
+- `fr_lincomb` for each statement's PI(zeta),
+- one MSM for P = sum rho_i (W_zeta_i + u_i W_omega_i),
+- one MSM for -Q over the key commitments, the per-proof commitments, and
+  the G1 generator (negations folded into the scalars), and
+- one 2-pair `pairing_check` against [tau]_2 and [1]_2.
+
+No per-proof pairing term exists; the only G2 points are the two SRS
+constants. Distinct verifying keys under one SRS share the 2-pair tail:
+each key adds its 8 commitment points to the -Q basis while the generator
+slot stays global.
+
+### Mixed Batches
+
+Batches may mix schemes. Each scheme section freezes under its own
+transcript exactly as specified above, and a joint layer binds them:
+
+```text
+seed = keccak256( mixed_tag || groth16_seed || be16(k)
+                  || plonk_seed_1 || ... || plonk_seed_k )
+```
+
+`mixed_tag` is a versioned constant distinct from both section tags, each
+section seed is the 32-byte digest its scheme's transcript already
+defines (an empty section still contributes its count-framed digest), and
+one randomizer stream indexed by verification equation spans the whole
+batch: Groth16 equations in proof order, then PLONK proofs in group
+order. The pair list is the Groth16 fold concatenated with one 2-pair
+PLONK tail per distinct SRS, decided by a single `pairing_check`. The
+small-exponents argument applies unchanged: every equation carries its
+own 128-bit randomizer, so cross-scheme cancellation of error terms
+survives with probability at most $2^{-128}$ per equation. No syscall or
+pricing change is involved; the mixed layer is SDK reference material
+like the per-scheme folds.
+
 ### Edge Cases
 
 - Zero pairs: `pairing_check` MUST error, not return the empty product (which

@@ -189,11 +189,6 @@ pub fn alt_bn128_fr_batch_invert(
     elems: &[PodScalar],
     out: &mut [PodScalar],
 ) -> Result<(), AltBn128Error>;
-
-pub fn alt_bn128_pairing_check(
-    enc: Endianness,
-    pairs: &[PodG1G2Pair],
-) -> Result<bool, AltBn128Error>;
 ```
 
 All wrappers return `AltBn128Error::InvalidInputData` for empty input, input
@@ -203,9 +198,7 @@ return of 1; `out` parameters are not modified on error. Wrappers derive counts
 from slice lengths, check limits before invoking a syscall, and always pass a
 defined `encoding`, so they cannot trigger the fatal aborts above. The SDK also
 implements `From<PodGtElement> for PodFp12` and
-`PodGtElement::identity(Endianness)`. `alt_bn128_pairing_check` is a wrapper
-composition, not a ninth syscall. It issues the Miller and final-exponentiation
-syscalls and compares the result with the encoded identity.
+`PodGtElement::identity(Endianness)`.
 
 The SDK types are 1-byte-aligned byte arrays:
 
@@ -324,8 +317,7 @@ accept any canonical bytes (see Security Considerations).
 A pairing check is a composition: one Miller call,
 `alt_bn128_pairing_final_exp`, and a byte comparison with
 `PodGtElement::identity(enc)`. There is no fused check or map syscall (see
-Alternatives Considered). The SDK ships the composition as
-`alt_bn128_pairing_check`. Programs may widen a `PodGtElement` to `PodFp12`,
+Alternatives Considered). Programs may widen a `PodGtElement` to `PodFp12`,
 combine final-exponentiated terms with `alt_bn128_fp12_mul`, and compare with
 the widened identity. Widened bytes can be stored as a cached fixed term.
 
@@ -466,9 +458,8 @@ validated pairs. The split form places that obligation on the program, and the
 deployed boolean is no substitute: it skips the G2 subgroup check, so after
 activation no syscall performs a fused check under the new validation rules.
 This proposal accepts that deliberately. The composition is two syscalls and a
-byte comparison with no data-dependent branching, the SDK ships it as the single
-wrapper `alt_bn128_pairing_check`, and a fused syscall would re-enter the
-runtime as a second way to express the same computation.
+byte comparison with no data-dependent branching, and a fused syscall would
+re-enter the runtime as a second way to express the same computation.
 
 ### A Proof-System-Specific Syscall
 

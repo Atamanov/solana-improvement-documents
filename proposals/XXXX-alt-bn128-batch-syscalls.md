@@ -32,9 +32,9 @@ proofs one at a time, and each proof pays four pairings even though a fixed
 verifying key needs only three plus one cached term. Proofs of the same circuit
 cannot share work. The boolean pairing result cannot be combined across calls,
 and every call re-derives the Miller line coefficients of G2 points that never
-change. PLONK verifiers do worse. Their field work (challenges, vanishing and
-Lagrange evaluations, batch inversion) runs in sBPF, and folding their
-commitments needs an MSM the runtime does not expose.
+change. PLONK and other KZG verifiers do worse. Their field work (challenges,
+vanishing and Lagrange evaluations, batch inversion) runs in sBPF, and folding
+their commitments needs an MSM the runtime does not expose.
 
 The proposal targets three outcomes:
 
@@ -44,9 +44,22 @@ The proposal targets three outcomes:
 2. A faster Miller loop over fixed G2 points. Prepared line coefficients remove
    the per-call derivation and subgroup check, at least 15% of a pairing call
    and growing with batch size, to be pinned by the fitted cost schedules.
-3. Efficient PLONK verification. The Fr inner product and batch inversion cover
-   the field work, the MSM folds commitments, and the composable pairing checks
-   the KZG opening against a prepared fixed G2 point.
+3. Efficient PLONK and KZG verification. The Fr inner product and batch
+   inversion cover the field work, the MSM folds commitments, and the
+   composable pairing checks the KZG opening against a prepared fixed G2
+   point.
+
+The gain per syscall:
+
+| Syscall | Gain |
+| --- | --- |
+| `g1_msm` | One call replaces a mul and an add per folded term |
+| `pairing_miller` | The Miller product survives the call, so terms combine |
+| `pairing_miller_prepared` | Skips line and subgroup work for VK and KZG tau |
+| `fp12_mul` | Three pairings per Groth16 proof instead of four |
+| `pairing_final_exp` | Paid once per batch instead of once per proof |
+| `fr_lincomb` | Groth16 batch input folds and PLONK field work off sBPF |
+| `fr_batch_invert` | One inversion for PLONK and KZG denominators |
 
 This serves proof relayers, privacy protocols, and compressed-state systems that
 verify the same circuit many times.

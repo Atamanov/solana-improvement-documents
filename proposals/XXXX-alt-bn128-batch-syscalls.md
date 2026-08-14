@@ -1,6 +1,6 @@
 ---
 simd: 'XXXX'
-title: BN254 Batch Verification Syscalls
+title: Composable BN254 Pairing Syscalls
 authors:
   - Alexander Atamanov (Helius), alexander@helius.xyz
   - Jorrit Palfner (Helius), jorrit@helius.xyz

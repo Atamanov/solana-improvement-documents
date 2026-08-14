@@ -2,8 +2,8 @@
 simd: 'XXXX'
 title: BN254 Batch Verification Syscalls
 authors:
-  - Alexander Atamanov (Helios), alexander@helios.xyz
-  - Jorrit Palfner (Helios), jorrit@helios.xyz
+  - Alexander Atamanov (Helius), alexander@helius.xyz
+  - Jorrit Palfner (Helius), jorrit@helius.xyz
 category: Standard
 type: Core
 status: Idea
@@ -16,47 +16,36 @@ feature: (fill in with feature tracking issues once accepted)
 This proposal adds typed BN254 (`alt_bn128`) syscalls for:
 
 1. **G1 multi-scalar multiplication**
-2. **Pairing operations** (Miller loop, Fp12 multiplication, final
-   exponentiation, pairing map, and pairing check)
+2. **Composable pairing operations** (G2 preparation, Miller loops over raw or
+   prepared inputs, Fp12 multiplication, and final exponentiation)
 3. **Scalar-field inner product and batch inversion**
 
-The existing group and compression syscalls remain unchanged.
+Each syscall reads and writes either the deployed big-endian encoding or a
+little-endian variant, selected per call. The existing group and compression
+syscalls remain unchanged.
 
 ## Motivation
 
-Solana programs already verify Groth16 proofs with the deployed BN254
-syscalls. The current interface is effective for a single Groth16 proof.
-It is not effective for workloads that collect many proofs and need to
-settle them together or PLONK.
-
-Batch verification shares work across proofs. Linear combinations become
-multi-scalar multiplications, and several pairing equations become one
-pairing product with one final exponentiation. The deployed interface does
-not expose those units of work. Programs must issue one scalar
-multiplication per term, and the pairing operation returns only a boolean.
-The boolean discards the target-group value, so a program cannot cache a
-fixed pairing term or combine partial products produced by separate calls.
-
-The result is that proof verification is available, but its throughput is
-bounded by repeated work that batch verification is designed to remove.
-This affects proof relayers, privacy protocols, and compressed-state
-systems that verify the same circuit many times. Scalar-field arithmetic
-is also still implemented in sBPF. This makes the field-heavy parts of
-polynomial-opening verifiers a separate bottleneck even when pairing
-support is available.
+Solana programs verify Groth16 proofs with the deployed BN254 syscalls, one
+proof at a time. Batch verification shares work across proofs. Linear
+combinations become multi-scalar multiplications, and several pairing equations
+become one pairing product with one final exponentiation. The deployed interface
+does not expose those units of work. Its pairing operation returns only a
+boolean, so a program cannot cache a fixed pairing term or combine partial
+products, and every call re-derives the Miller line coefficients of G2 points
+that never change. Scalar-field arithmetic still often runs in sBPF.
 
 This proposal exposes the shared work directly. G1 MSM performs the linear
-folds. The pairing pipeline lets programs choose a fused check or assemble
-one product from several Miller results before paying for final
-exponentiation. The Fr helpers cover the field operations that dominate
-polynomial-opening verifiers.
+folds, the pairing pipeline prepares fixed G2 points once and combines Miller
+results before one final exponentiation, and the Fr helpers cover the field work
+that dominates polynomial-opening verifiers. This benefits proof relayers,
+privacy protocols, and compressed-state systems that verify the same circuit
+many times.
 
-The proposal also avoids the opaque-buffer pattern for these new
-operations. `sol_alt_bn128_group_op` accepts bytes plus a byte length.
-Two length checks in that interface required later fixes ([SIMD-0222],
-[SIMD-0334]). The Edwards and Ristretto APIs instead use typed point and
-scalar pointers with an element count. This proposal uses the same shape
-for BN254, including typed result pointers.
+The new operations avoid the opaque-buffer pattern of `sol_alt_bn128_group_op`,
+whose byte-length contract required two later fixes ([SIMD-0222], [SIMD-0334]).
+Like the Edwards and Ristretto APIs, they use typed point and scalar pointers
+with an element count.
 
 [SIMD-0222]: https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0222-fix-alt-bn128-multiplication-length-check.md
 [SIMD-0334]: https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0334-fix-alt-bn128-pairing-length-check.md
@@ -67,71 +56,144 @@ for BN254, including typed result pointers.
 
 - Miller result: An Fp12 value produced before final exponentiation.
 
-- GT element: A nonzero Fp12 value in the pairing target group.
+- GT element: A value in the target group, the order-`r` multiplicative subgroup
+  of Fp12 and the image of final exponentiation.
+
+- Prepared G2: The fixed sequence of Miller-loop line coefficients derived from
+  a G2 point, computed once and reused across pairing calls.
 
 ## Detailed Design
 
-The new operations expose arithmetic rather than a proof format or
-transcript. Programs remain responsible for constructing their own
-verification equations.
+The operations expose arithmetic, not a proof format or transcript. Programs
+construct their own verification equations.
 
-The current Agave experiment implements the typed G1 MSM, pairing check,
-pairing map, Fr inner product, and Fr batch inversion. This proposal
-exposes those operations through safe SDK functions and adds the Miller,
-Fp12 multiplication, and final exponentiation calls needed for partial
-pairing products. The proof-system-specific reducers on the experimental
-branch are not part of this proposal.
+### Syscall Interface
+
+The proposal adds eight syscalls. Every argument is an unsigned 64-bit value in
+the standard syscall argument registers, in the listed order. Address arguments
+are virtual-machine addresses of the typed values defined below. The first
+argument of every syscall, `encoding`, accepts exactly two values:
+
+```text
+ALT_BN128_BE = 0x00   big-endian, the deployed byte order
+ALT_BN128_LE = 0x80   little-endian
+```
+
+Any other value is misuse.
+
+The table lists the remaining arguments.
+
+| Symbol | Arguments after `encoding` | Result bytes |
+| --- | --- | ---: |
+| `sol_alt_bn128_g1_msm` | `points, scalars, count, result` | 64 |
+| `sol_alt_bn128_g2_prepare` | `point, result` | 16704 |
+| `sol_alt_bn128_pairing_miller` | `pairs, count, result` | 384 |
+| `sol_alt_bn128_pairing_miller_prepared` | `g1s, preps, count, result` | 384 |
+| `sol_alt_bn128_fp12_mul` | `a, b, result` | 384 |
+| `sol_alt_bn128_pairing_final_exp` | `f, result` | 384 |
+| `sol_alt_bn128_fr_lincomb` | `a, b, count, result` | 32 |
+| `sol_alt_bn128_fr_batch_invert` | `elems, count, result` | `32 * count` |
+
+`sol_alt_bn128_g1_msm`, `sol_alt_bn128_fr_lincomb`, and
+`sol_alt_bn128_pairing_miller_prepared` take one count for both input arrays, so
+that a length mismatch cannot exist at the syscall boundary.
+
+Each syscall returns 0 on success and 1 on any rejected input value, without
+distinguishing causes. Per [SIMD-0129], interface misuse is not a rejected
+value. An undefined `encoding`, and a count of zero or above the operation's
+cap, abort execution with a transaction error, like other invalid syscall usage.
+
+[SIMD-0129]: https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0129-alt-bn128-simplified-error-code.md
+
+### Memory Semantics
+
+Each input region must be readable and each result region writable for the full
+byte length implied by its type and `count`. Execution order:
+
+1. Abort on interface misuse as defined above, before any memory access.
+2. Translate every region. An unmapped or mispermissioned region aborts the
+   virtual machine, as with other syscalls.
+3. Validate values. A rejected value returns 1 and leaves the result region
+   unmodified.
+4. Compute and write the result.
+
+Implementations must behave as if all input bytes were read before any result
+byte is written, so a result region may overlap an input region.
 
 ### SDK Interface
 
 The SDK exposes safe, typed wrappers. Programs pass slices and receive typed
-results; they do not provide element counts, output buffers, or syscall status
-codes.
+results. Two wrappers write through caller-provided references:
+`alt_bn128_g2_prepare` (16,704 bytes exceeds an SBF stack frame) and
+`alt_bn128_fr_batch_invert` (65,536 bytes at the cap exceeds the default heap).
+A single prepared value fits the default 32 KiB program heap. A prepared array
+at the pairing cap is 1,069,056 bytes, beyond the 256 KiB maximum heap, so
+programs store prepared bytes in account data and pass them to the syscall in
+place. The types are 1-byte-aligned, so an account-data slice casts directly.
 
 ```rust
+pub enum Endianness {
+    Le,
+    Be,
+}
+
 pub fn alt_bn128_g1_msm(
+    enc: Endianness,
     points: &[PodG1Point],
     scalars: &[PodScalar],
 ) -> Result<PodG1Point, AltBn128Error>;
 
+pub fn alt_bn128_g2_prepare(
+    enc: Endianness,
+    point: &PodG2Point,
+    out: &mut PodPreparedG2,
+) -> Result<(), AltBn128Error>;
+
 pub fn alt_bn128_pairing_miller(
+    enc: Endianness,
     pairs: &[PodG1G2Pair],
 ) -> Result<PodFp12, AltBn128Error>;
 
+pub fn alt_bn128_pairing_miller_prepared(
+    enc: Endianness,
+    g1_points: &[PodG1Point],
+    prepared: &[PodPreparedG2],
+) -> Result<PodFp12, AltBn128Error>;
+
 pub fn alt_bn128_fp12_mul(
+    enc: Endianness,
     a: &PodFp12,
     b: &PodFp12,
 ) -> Result<PodFp12, AltBn128Error>;
 
 pub fn alt_bn128_pairing_final_exp(
+    enc: Endianness,
     f: &PodFp12,
 ) -> Result<PodGtElement, AltBn128Error>;
 
-pub fn alt_bn128_pairing_check(
-    pairs: &[PodG1G2Pair],
-) -> Result<bool, AltBn128Error>;
-
-pub fn alt_bn128_pairing_map(
-    pairs: &[PodG1G2Pair],
-) -> Result<PodGtElement, AltBn128Error>;
-
 pub fn alt_bn128_fr_lincomb(
+    enc: Endianness,
     a: &[PodScalar],
     b: &[PodScalar],
 ) -> Result<PodScalar, AltBn128Error>;
 
 pub fn alt_bn128_fr_batch_invert(
-    a: &[PodScalar],
-) -> Result<Vec<PodScalar>, AltBn128Error>;
+    enc: Endianness,
+    elems: &[PodScalar],
+    out: &mut [PodScalar],
+) -> Result<(), AltBn128Error>;
 ```
 
-`alt_bn128_g1_msm` and `alt_bn128_fr_lincomb` return
-`AltBn128Error::InvalidInputData` when their input slices have different
-lengths. Every slice-taking wrapper returns the same error for an empty input,
-an input over the operation's limit, or a value rejected by the validation
-rules below. The fixed-size wrappers return that error for a rejected value.
+All wrappers return `AltBn128Error::InvalidInputData` for empty input, input
+over a limit, mismatched slice lengths (including `out` versus `elems` in
+`alt_bn128_fr_batch_invert`), a value rejected by the rules below, or a syscall
+return of 1; `out` parameters are not modified on error. Wrappers derive counts
+from slice lengths, check limits before invoking a syscall, and always pass a
+defined `encoding`, so they cannot trigger the fatal aborts above. The SDK also
+implements `From<PodGtElement> for PodFp12` and
+`PodGtElement::identity(Endianness)`.
 
-The SDK types are byte-aligned Pod values:
+The SDK types are 1-byte-aligned byte arrays:
 
 ```rust
 #[repr(C)]
@@ -141,40 +203,44 @@ pub struct PodG1G2Pair {
 }
 ```
 
-| Pod type | Representation |
+| Type | Representation |
 | --- | --- |
 | `PodG1Point` | `#[repr(transparent)] [u8; 64]` |
 | `PodG2Point` | `#[repr(transparent)] [u8; 128]` |
 | `PodScalar` | `#[repr(transparent)] [u8; 32]` |
 | `PodFp12` | `#[repr(transparent)] [u8; 384]` |
 | `PodGtElement` | `#[repr(transparent)] [u8; 384]` |
+| `PodPreparedG2` | `#[repr(transparent)] [u8; 16704]` |
 
-`PodG1G2Pair` is 192 bytes with no padding.
-
-The wrappers derive element counts from slice lengths. They return `Ok(false)`
-for a false pairing verdict; a false verdict is not an error.
-The runtime reads all input values before writing a result.
+`PodG1G2Pair` is 192 bytes with no padding. Every type implements the byte-cast
+(`Pod`) traits except `PodGtElement`, which keeps its field private, so safe
+code obtains one only from `alt_bn128_pairing_final_exp` or
+`PodGtElement::identity`, and each source yields a value in GT. This is API
+guidance, not a security boundary. The syscall sees only bytes, and any 384
+bytes can be submitted as `PodFp12`. The types carry no endianness of their own.
 
 ### Encoding
 
-G1, G2, pairs, and scalars use the existing big-endian alt_bn128
-encoding:
+Two encodings are defined, selected by the `encoding` values of the Syscall
+Interface section. Point and scalar bytes match deployed behavior and are not
+redefined here: `ALT_BN128_BE` is the deployed big-endian alt_bn128 encoding,
+and `ALT_BN128_LE` is the deployed [SIMD-0284] little-endian variant, the byte
+reversal of each 32-byte scalar and each point coordinate, so an Fq2 coordinate
+reads `c1 || c0` under BE and `c0 || c1` under LE. Points are `x || y` and
+all-zero point bytes encode infinity under both. `PodG1G2Pair` is a G1 point
+followed by a G2 point.
 
-| Type | Size | Encoding |
-| --- | ---: | --- |
-| `PodG1Point` | 64 | `x || y` |
-| `PodG2Point` | 128 | `x.c1 || x.c0 || y.c1 || y.c0` |
-| `PodScalar` | 32 | canonical scalar below `r` |
-| `PodG1G2Pair` | 192 | G1 followed by G2 |
+Decoding rejects a coordinate or coefficient greater than or equal to `p` and a
+scalar greater than or equal to `r`, the moduli of the deployed operations.
+Values are never reduced. Every result is canonical, so byte equality is value
+equality within one encoding. The two encodings of a value differ byte-wise, so
+a program must store and compare bytes under one encoding.
 
-All-zero point bytes encode infinity. Other coordinates are canonical
-base-field elements and are not reduced modulo `p`. Scalars are
-canonical scalar-field elements and are not reduced modulo `r`.
-`p` and `r` are the fields used by the deployed alt_bn128 operations.
+[SIMD-0284]: https://github.com/solana-foundation/solana-improvement-documents/blob/main/proposals/0284-alt-bn128-little-endian.md
+[SIMD-0388]: https://github.com/solana-foundation/solana-improvement-documents/pull/388
 
-`alt_bn128_pairing_check` returns a Rust `bool`.
-
-Fp12 uses this tower and coefficient notation:
+The Fp12, GT, and prepared-G2 layouts are new and specified here directly. Fp12
+uses this tower and coefficient notation:
 
 ```text
 Fq2  = Fq[u]  / (u^2 + 1),       a = c0 + c1*u
@@ -182,31 +248,33 @@ Fq6  = Fq2[v] / (v^3 - (9 + u)), b = c0 + c1*v + c2*v^2
 Fq12 = Fq6[w] / (w^2 - v),       f = c0 + c1*w
 ```
 
-`PodFp12` and `PodGtElement` are exactly 384 bytes. They contain twelve
-canonical, big-endian, 32-byte Fq coefficients in this order:
+`PodFp12` and `PodGtElement` hold twelve canonical 32-byte Fq coefficients.
+Under LE they appear in tower order, lowest degree first, each Fq little-endian:
 
 ```text
 c0.c0.c0, c0.c0.c1, c0.c1.c0, c0.c1.c1, c0.c2.c0, c0.c2.c1,
 c1.c0.c0, c1.c0.c1, c1.c1.c0, c1.c1.c1, c1.c2.c0, c1.c2.c1
 ```
 
-The encoding follows the tower order: Fq12 `c0` then `c1`, each Fq6
-`c0`, `c1`, then `c2`, and each Fq2 `c0` then `c1`. 
+Under BE the order reverses and each Fq is big-endian: the BE encoding is the
+byte reversal of the LE encoding, the rule SIMD-0388 uses for its target group.
+The identity is `0x01` then 383 zeros under LE, and the reverse under BE. The
+coefficient order is part of the consensus interface: every validator must
+interpret the same bytes under the same encoding as the same value.
 
-Programs can pass these bytes from `alt_bn128_pairing_miller` to
-`alt_bn128_fp12_mul` and `alt_bn128_pairing_final_exp`. The coefficient
-order is therefore part of the consensus interface: every validator must
-interpret the same 384 bytes as the same Fp12 value.
+The two types share a layout but differ semantically: `PodFp12` is any canonical
+Fp12 value. `PodGtElement` is an opaque GT value that no syscall accepts
+directly, so a program widens it to `PodFp12` first. The separation binds only
+the SDK.
 
-Decoding rejects any coefficient greater than or equal to `p`; coefficients
-are not reduced modulo `p`.
-
-The Fp12 identity has `c0.c0.c0 = 1` and every other coefficient equal
-to zero. `PodFp12` and `PodGtElement` have the same byte layout but
-different semantic domains. `PodFp12` is a general canonical Fp12 value.
-`PodGtElement` is a nonzero value in the GT subgroup. No operation accepts
-it as input. An SDK conversion from untrusted bytes validates that the value
-is nonzero and belongs to GT.
+A `PodPreparedG2` holds exactly 87 line-coefficient triples `(c0, c1, c2)`, each
+component an Fq2 under the selected encoding, in the evaluation order of the V0
+Pairing Definition (see appendix). Triple and sequence order do not vary with
+encoding. The count follows the ate loop: 64 doubling steps, 21 addition steps
+for the nonzero loop digits below the top one, and 2 final Frobenius steps. The
+prepared format is versioned by the syscall symbols. A schedule or layout change
+requires new symbols behind a new feature gate, and stored V0 bytes stay valid
+under the V0 symbols indefinitely.
 
 ### G1 Multi-Scalar Multiplication
 
@@ -216,62 +284,76 @@ is nonzero and belongs to GT.
 result = sum(scalars[i] * points[i])
 ```
 
-The syscall validates every point and scalar before arithmetic. A G1
-point is either the all-zero infinity encoding or a canonical point on
-the curve. G1 has cofactor 1, so no separate subgroup check is needed.
-Infinity and zero scalars contribute the identity. An identity result is
-written as all-zero point bytes.
+The syscall validates every point and scalar before arithmetic. A G1 point is
+either the all-zero infinity encoding or a canonical point on the curve. G1 has
+cofactor 1, so no separate subgroup check is needed. Infinity and zero scalars
+contribute the identity. An identity result is written as all-zero point bytes.
 
 ### Pairing Operations
 
-The pairing operations expose both fused and composable forms:
+The pairing pipeline is fully composable:
 
-- `alt_bn128_pairing_miller` returns the product of the Miller loops
-  for all input pairs, before final exponentiation.
+- `alt_bn128_g2_prepare` validates a G2 point and returns its Miller line
+  coefficients.
+- `alt_bn128_pairing_miller` returns the product of the Miller loops for all
+  input pairs, before final exponentiation.
+- `alt_bn128_pairing_miller_prepared` returns the same product for G1 points
+  paired with prepared G2 values.
 - `alt_bn128_fp12_mul` multiplies two canonical Fp12 values.
-- `alt_bn128_pairing_final_exp` applies the BN254 final exponent to a
-  nonzero Fp12 value and returns a `PodGtElement`.
-- `alt_bn128_pairing_map` performs the Miller loops and final
-  exponentiation in one call.
-- `alt_bn128_pairing_check` performs the map and returns whether the
-  result is the GT identity.
+- `alt_bn128_pairing_final_exp` raises a nonzero Fp12 value to the BN254 final
+  exponent `(p^12 - 1) / r` and returns a `PodGtElement`.
+
+`alt_bn128_fp12_mul`, `alt_bn128_pairing_final_exp`, and
+`alt_bn128_pairing_miller_prepared` are provenance-sensitive primitives. They
+accept any canonical bytes, and the soundness of an equation built from them
+rests entirely on the calling program (see Security Considerations).
+
+A pairing check is a composition: one Miller call,
+`alt_bn128_pairing_final_exp`, and a byte comparison with
+`PodGtElement::identity(enc)`. There is no fused check or map syscall (see
+Alternatives Considered). Programs may widen a `PodGtElement` to `PodFp12`,
+combine final-exponentiated terms with `alt_bn128_fp12_mul`, and compare with
+the widened identity. Widened bytes can be stored as a cached fixed term.
 
 For accepted inputs, the operations satisfy:
 
 ```text
-pairing_map(pairs)   = final_exp(miller(pairs))
-pairing_check(pairs) = true  iff  pairing_map(pairs) is GT identity
+miller_prepared(g1s, [prepare(q) for q in g2s]) = miller(pairs)
 final_exp(fp12_mul(miller(A), miller(B)))
-                     = pairing_map(A concatenated with B)
+                     = final_exp(miller(A concatenated with B))
 ```
 
-The last identity applies when the concatenated pair list is within the
-map limit.
+where `pairs` zips `g1s` with `g2s`. The first identity requires that no G2
+point is infinity, because preparation rejects the infinity encoding. The second
+requires the concatenated list to be within `ALT_BN128_PAIRING_MAX_PAIRS`.
 
-Each pair is validated before arithmetic. G1 uses the rules above. G2 is
-either the all-zero infinity encoding or a canonical point on the twist
-in the order-`r` subgroup. Subgroup membership means `[r]Q` is infinity.
-A pair with an infinity member contributes the Fp12 identity after both
-members have been validated.
+Each raw pair is validated before arithmetic: G1 by the rules above, G2 as the
+all-zero infinity encoding or a canonical point on the twist in the order-`r`
+subgroup (`[r]Q` is infinity). A pair with an infinity member contributes the
+Fp12 identity after validation.
 
-The Miller result is observable and therefore requires a single
-byte-exact definition. Before this proposal advances from Idea, its V0
-definition will pin the pairing orientation, loop schedule, twist
-embedding, line normalization, and final steps to immutable reference
-source. Conformance vectors will cover the reference source but will not
-replace it. Agreement only after final exponentiation is not sufficient
-for this syscall.
+`alt_bn128_g2_prepare` performs the same full G2 validation but rejects
+infinity, which a program handles by dropping that pair. A fixed verifying key
+is prepared once, stored, and reused.
 
-The all-zero Fp12 value is valid input to `alt_bn128_fp12_mul`.
-`alt_bn128_pairing_final_exp` rejects it because zero is not in the
-multiplicative group mapped to GT. The fused map and check never accept an
-Fp12 value from the caller.
+`alt_bn128_pairing_miller_prepared` validates G1 points and checks every
+prepared coefficient for canonicality, nothing else: the runtime treats prepared
+bytes as opaque field elements and must not attempt to verify their provenance.
+An infinity G1 contributes the identity for its pair.
 
-For non-empty, in-subgroup inputs,
-`alt_bn128_pairing_check` returns the same verdict as the deployed
-pairing operation. The new syscall also validates G2 subgroup membership,
-which the deployed operation does not. Empty input is rejected instead of
-returning a vacuous true result.
+Two correct Miller implementations can produce different intermediate Fp12 bytes
+for the same pairs and still agree after final exponentiation. The deployed
+boolean pairing needs only that agreement, so clients were free to differ
+internally. These syscalls return the Miller result itself, making its bytes
+consensus-observable, so every client must compute it identically. The V0
+Pairing Definition in the appendix fixes the computation byte-exactly and is
+normative.
+
+The all-zero Fp12 value is valid input to `alt_bn128_fp12_mul` but rejected by
+`alt_bn128_pairing_final_exp`. A Miller product over validated pairs is never
+zero. Forged prepared coefficients can produce zero. For in-subgroup inputs,
+the composed check matches the deployed pairing verdict. The new syscalls
+additionally validate the G2 subgroup, which the deployed operation does not.
 
 ### Scalar-Field Operations
 
@@ -281,126 +363,261 @@ returning a vacuous true result.
 result = sum(a[i] * b[i]) mod r
 ```
 
-`alt_bn128_fr_batch_invert` returns `a[i]^-1` for each input. It
-rejects the entire input if any element is zero. Both operations validate
-all canonical scalars before returning a result.
+`alt_bn128_fr_batch_invert` returns `a[i]^-1` for each input. It rejects the
+entire input if any element is zero. Both operations validate every scalar
+before computing a result.
 
 ### Length Limits
 
 ```rust
 pub const ALT_BN128_G1_MSM_MAX_POINTS: u64 = 2048;
-pub const ALT_BN128_PAIRING_MAX_PAIRS: u64 = 256;
-pub const ALT_BN128_PAIRING_MAP_MAX_PAIRS: u64 = 16;
+pub const ALT_BN128_PAIRING_MAX_PAIRS: u64 = 64;
 pub const ALT_BN128_FR_MAX_ELEMS: u64 = 2048;
 ```
 
-The check and Miller syscalls use `ALT_BN128_PAIRING_MAX_PAIRS`. The map
-uses the range calibrated by the current batch-syscall experiment.
-Fp12 multiplication and final exponentiation have fixed-size inputs. The
-map limit is provisional until the final pricing sweep.
+Both Miller operations share `ALT_BN128_PAIRING_MAX_PAIRS`. The other pairing
+operations have fixed-size inputs. A count equal to a cap is valid. Zero and
+above-cap counts abort as Memory Semantics specifies.
 
-All counted operations reject a count of zero. A count equal to the cap
-is valid. A count above the cap returns 1 if the compute charge succeeds.
+The pairing cap is set so a full-cap call is achievable: at the deployed
+per-pair pairing cost (36,364 CU for the first pair, 12,121 CU for each
+additional), 64 pairs cost about 800,000 CU, within the 1,400,000 CU transaction
+budget, and prepared inputs at the cap are 1,069,056 bytes, within a single
+account.
 
-### Compute Metering
+### Edge Cases
 
-Memory translation failure and compute budget exhaustion abort the virtual
-machine instead of returning `AltBn128Error`.
+- **Zero count.** Aborts execution, because a vacuous result is a verification
+hazard: an empty Miller product is the Fp12 identity, so a pairing check over an
+accidentally empty list would pass. A zero count is a program bug, and aborting
+fails closed. This deliberately departs from SIMD-0388, which returns the GT
+identity for an empty pair list.
+- **Infinity.** All-zero point bytes are infinity under both encodings. A raw
+pair with an infinity member contributes the Fp12 identity.
+`alt_bn128_g2_prepare` rejects infinity.
+- **Field boundaries.** Coordinates and coefficients equal to `p` and scalars
+equal to `r` are rejected; `p - 1` and `r - 1` are valid.
+- **Zero Fp12.** Valid input to `alt_bn128_fp12_mul`, rejected by
+`alt_bn128_pairing_final_exp`.
+- **Overlap.** A result region may overlap an input region. Behavior is
+read-all-then-write.
+- **Mixed encodings.** Each call interprets bytes under its own `encoding`.
+Passing LE bytes under `ALT_BN128_BE` yields a different value that may still be
+canonical and accepted.
 
-Counted syscalls execute in this order:
+### Compute Cost
 
-1. Compute and consume the charge from the declared count.
-2. Return 1 if the count is zero or above the cap.
-3. Translate and copy each input region in signature order.
-4. Validate the copied values.
-5. Compute the result.
-6. Translate the result region and write the result.
-
-If the charge exceeds the remaining budget, step 1 aborts and saturates
-the remaining budget to zero. Memory faults in steps 3 or 6 abort after
-the charge. Domain errors after step 1 consume the charge and leave the
-result unchanged.
-
-Fp12 multiplication and final exponentiation use the same order without
-the count check.
-
-All cost arithmetic uses saturating `u64` operations. Integer division
-rounds down.
-
-The experimental implementation contains fitted schedules for G1 MSM,
-pairing check, pairing map, inner product, and batch inversion. The
-Miller, Fp12 multiplication, and final-exponentiation schedules will be
-fitted with the same public harness before this proposal advances from
-Idea. The accepted revision will include all constants and formulas.
-Every validator charges the same amount regardless of its arithmetic
-backend.
+Each syscall consumes a deterministic charge of the form
+`base + per_element * count` (fixed-input operations charge `base`), consumed
+before memory translation per the deployed convention. The constants are
+consensus-critical and will be fixed by cross-client benchmarking before
+activation. The caps bound per-call memory and validation work within what the
+transaction compute budget can execute (see Length Limits).
 
 ### Feature Activation
 
-One feature gate registers all eight symbols. Before activation, the
-symbols are unavailable. Activation does not change
-`sol_alt_bn128_group_op` or `sol_alt_bn128_compression`.
+One feature gate registers all eight symbols; the operations ship and activate
+as a single family. Before activation, the symbols are unavailable. Activation
+does not change `sol_alt_bn128_group_op` or `sol_alt_bn128_compression`.
+
+### Validator Components Affected
+
+| Component | Impact |
+| --- | --- |
+| Transaction execution (SVM) | Eight new stateless syscalls |
+| Virtual machine | Syscall registration behind one gate |
+| Compute budget | New per-operation charges |
+| SDK | Pod types and safe wrappers |
+| Consensus, gossip, Turbine, snapshots | None |
 
 ## Alternatives Considered
 
 ### Extend `sol_alt_bn128_group_op`
 
-New operation identifiers could be added to the existing opaque-buffer
-syscall. That would preserve one symbol, but it would also preserve the
-byte-length contract that required SIMD-0222 and SIMD-0334. MSM and
-pairing already need counts, while the Fr and Fp12 operations have
-different input and output shapes. Dedicated typed signatures make those
-contracts explicit and leave the deployed operation unchanged.
+New operation identifiers could be added to the existing opaque-buffer syscall,
+preserving one symbol but also the byte-length contract that required SIMD-0222
+and SIMD-0334. Dedicated typed signatures make the count and shape contracts
+explicit and leave the deployed operation unchanged.
 
-### Fused Pairing Operations Only
+### Fused Check and Map Syscalls
 
-A check and map are sufficient when all pairs fit in one call. They are
-not sufficient when a program needs to combine independently produced
-pairing terms before one final exponentiation. A GT-only design can
-combine mapped chunks, but it pays final exponentiation for every chunk.
-The Miller/Fp12 path keeps that fixed work shared.
-
-The tradeoff is that Miller output becomes consensus-visible. This
-proposal accepts that cost and requires a byte-exact V0 definition.
+Earlier drafts included fused `pairing_check` and `pairing_map` syscalls. Both
+are exact compositions of the retained calls. A fused form is misuse-resistant,
+because the runtime knows its final-exponentiation input came directly from
+validated pairs. The split form places that obligation on the program. This
+proposal deliberately trades that resistance for a composable surface with one
+way to express each computation, keeps the deployed operation as the single-call
+boolean over raw pairs, and states the program obligations in Security
+Considerations.
 
 ### A Proof-System-Specific Syscall
 
-A Groth16 or a particular PLONK verifier syscall could expose a smaller
-surface. It would also fix the proof encoding, transcript, and supported
-variant in the runtime. Arithmetic syscalls can be reused by different
-verifiers and leave transcript construction in the program.
+A Groth16 or PLONK verifier syscall could expose a smaller surface, but it would
+fix the proof encoding, transcript, and variant in the runtime. Arithmetic
+syscalls are reusable across verifiers and leave transcript construction in the
+program.
 
-### Prepared G2 Inputs
+### Extend the Generic `sol_curve_*` Interface
 
-Prepared line coefficients would avoid repeated preparation of fixed G2
-points, but they are not self-authenticating group elements. The runtime
-prepares G2 only after validating a raw point. Pairing inversion is
-expressed by negating G1 or G2, so this proposal also omits Fp12
-inversion.
+The existing `sol_curve_multiscalar_mul` could take a BN254 G1 curve identifier
+instead of adding `sol_alt_bn128_g1_msm`. That precedent is weaker than it
+looks: SIMD-0388 extends `sol_curve_group_op`, `sol_curve_validate_point`,
+`sol_curve_pairing_map`, and `sol_curve_decompress` for BLS12-381, but leaves
+the MSM syscall untouched, so no pairing curve goes through the generic MSM
+today. Its shape also does not fit: it takes 32-byte compressed little-endian
+curve25519 points, while BN254 G1 here is a 64-byte affine point under a
+per-call BE/LE selector aligned with the deployed alt_bn128 encodings.
+
+The rest of this family has no generic home at all: the `sol_curve_*` surface
+defines no Miller results, Fp12 multiplication, prepared inputs, or scalar-field
+helpers. Dedicated syscalls are needed regardless, and routing only the MSM
+through the generic ABI would split one family across two ABIs with different
+selectors, argument conventions, and feature gates. A later SIMD can still add
+BN254 identifiers to the generic interface; this proposal does not block it.
+
+### Raw G2 Inputs Only
+
+Omitting prepared inputs would keep every pairing input a self-authenticating
+group element, but would re-derive the line coefficients of fixed verifying-key
+points in every verification. The prepared path stays, with its trust model
+stated in Security Considerations. Pairing inversion is expressed by negating G1
+or G2, so Fp12 inversion is also omitted.
 
 ## Impact
 
-Programs can batch BN254 proof verification without adopting a
-runtime-defined proof format. Existing programs and existing alt_bn128
-syscalls are unchanged.
+Programs can batch BN254 proof verification without adopting a runtime-defined
+proof format, and can amortize G2 preparation across verifications of a fixed
+verifying key. Existing programs are unaffected.
 
-Validator clients add eight stateless, feature-gated syscalls and a
-byte-exact Fp12 consensus representation. SDKs add the corresponding Pod
-types and safe slice-based wrappers.
+Validator clients add eight stateless, feature-gated syscalls and byte-exact
+consensus representations for Fp12 values and prepared G2 coefficients, each in
+two encodings. SDKs add the corresponding Pod types and safe slice-based
+wrappers.
 
 ## Security Considerations
 
-The runtime validates canonical field encodings, curve membership, and
-G2 subgroup membership before pairing arithmetic. This is stricter than
-the deployed pairing operation, which does not check the G2 subgroup.
+The runtime validates canonical encodings, curve membership, and the G2 subgroup
+before pairing arithmetic and preparation. This is stricter than the deployed
+pairing operation, which skips the subgroup check, so a program mixing the two
+over the same inputs can accept on one path and reject on the other. A
+verification equation should migrate as a unit.
 
-The composable pairing interface accepts caller-supplied Fp12 values.
-Final exponentiation does not prove that a value, or every factor in a
-product, came from a Miller loop. A verifier that includes an
-unauthenticated Fp12 factor and checks only whether final exponentiation
-produces the identity is unsound. Programs that do not need composition
-should use `pairing_check`, which only accepts validated G1/G2 pairs.
+The composable interface accepts caller-supplied Fp12 values, and final
+exponentiation proves nothing about their origin. A verifier that admits one
+unauthenticated Fp12 factor is unsound. An attacker supplies the off-chain
+inverse of the legitimate Miller output, the product becomes the identity, and
+every canonicality check passes. A sound check feeds final exponentiation only
+Miller output over validated pairs and trusted program-owned bytes.
 
-Batch soundness also depends on the calling program's transcript and
-randomizers. These syscalls perform arithmetic only. They do not define
-or validate a batching transcript.
+Prepared G2 bytes carry the same trust model. Only canonicality is checked, so
+a caller who forges coefficients chooses the Miller output freely, including a
+value that makes the composed check accept. They must come from
+`alt_bn128_g2_prepare` or trusted program-owned state.
+
+Comparing a product of widened `PodGtElement` values with the encoded identity
+is sound only under the same provenance rules, and GT membership never binds a
+factor to a statement; the program's equation must. Batch soundness also depends
+on the program's transcript and randomizers, which these syscalls do not define
+or validate.
+
+## Drawbacks
+
+The prepared representation freezes one Miller schedule and one layout as a
+permanent, program-stored ABI. The composable Fp12 and prepared inputs are
+expert primitives that a careless verifier can misuse. A single feature gate
+means the family activates or rolls back as a whole; no operation can ship
+separately.
+
+## Conformance
+
+Cross-client vectors must cover, under both encodings: counts of 1, the cap, and
+the abort cases zero and cap plus one; coordinates and coefficients at `p - 1`
+and `p`, scalars at `r - 1` and `r`, infinity encodings, non-subgroup G2 points,
+the zero Fp12 value, forged prepared coefficients including triples that zero
+the Miller product, overlapping input and result regions, no-write-on-error and
+the precedence of aborts over value rejections.
+Miller-result and prepared-coefficient vectors are generated from the V0 Pairing
+Definition in the appendix.
+
+## Appendix: V0 Pairing Definition
+
+This definition is normative. The pairing is the optimal ate pairing on BN254
+with curve parameter `x = 4965661367192848881`. The loop scalar is `6x + 2`,
+processed in the signed-digit form below, least significant digit first:
+
+```text
+ 0,  0,  0,  1,  0,  1,  0, -1,  0,  0, -1,  0,  0,  0,  1,  0,  0, -1,  0, -1,
+ 0,  0,  0,  1,  0, -1,  0,  0,  0,  0, -1,  0,  0,  1,  0, -1,  0,  0,  1,  0,
+ 0,  0,  0,  0, -1,  0,  0, -1,  0,  1,  0, -1,  0,  0,  0, -1,  0, -1,  0,  0,
+ 0,  1,  0,  1,  1
+```
+
+Libraries encode `6x + 2` in differing signed forms with differing step counts,
+so only this listing is normative.
+
+G2 points lie on the sextic D-twist `y^2 = x^3 + 3/(9 + u)` over Fq2. A
+coefficient triple `(c0, c1, c2)` evaluated at a G1 point `(x_P, y_P)` is the
+sparse Fp12 element `c0*y_P + (c1*x_P)*w + c2*v*w` in the tower notation of the
+Encoding section.
+
+Preparation tracks `R = (X, Y, Z)` in homogeneous projective coordinates over
+Fq2, starting at `(x_Q, y_Q, 1)`. Scanning the digits from the second most
+significant down to the least significant, each position emits one doubling
+triple, and each nonzero digit emits one addition triple with `Q` for digit 1
+and the negation `(x_Q, -y_Q)` for digit -1. Division by 2 is multiplication
+by the inverse of 2 in Fq:
+
+```text
+double(R = (X, Y, Z)), with b' = 3/(9 + u):
+  A = X*Y/2;  B = Y^2;  C = Z^2
+  E = 3*b'*C;  F = 3*E;  G = (B + F)/2
+  H = (Y + Z)^2 - (B + C);  I = E - B;  J = X^2
+  X' = A*(B - F);  Y' = G^2 - 3*E^2;  Z' = B*H
+  triple = (-H, 3*J, I)
+
+add(R = (X, Y, Z), Q = (x_Q, y_Q)):
+  T = Y - y_Q*Z;  L = X - x_Q*Z
+  C = T^2;  D = L^2;  E = L*D;  F = Z*C;  G = X*D
+  H = E + F - 2*G
+  X' = L*H;  Y' = T*(G - H) - E*Y;  Z' = Z*E
+  triple = (L, -T, T*x_Q - L*y_Q)
+```
+
+After the loop, two final addition triples are emitted with `Q1` and then `Q2`,
+where `a^p` is the Fq2 Frobenius (conjugation) and `xi = 9 + u`:
+
+```text
+Q1 = (x_Q^p  * xi^((p-1)/3),    y_Q^p  * xi^((p-1)/2))
+Q2 = (x_Q1^p * xi^((p-1)/3),  -(y_Q1^p * xi^((p-1)/2)))
+```
+
+The Miller loop starts at `f = 1` and consumes triples in emission order: at
+each digit position `f` is squared (except at the first processed position),
+then multiplied by every pair's doubling line and, for a nonzero digit, by every
+pair's addition line. The two final triples are consumed the same way after
+the loop, with no squaring before them. The loop scalar is positive, no
+conjugation follows the loop. The Miller
+result is `f`. The pairing map is `f^((p^12 - 1) / r)`. Conformance vectors
+cover this definition but do not replace it.
+
+### GT Byte Order
+
+Point and scalar byte order is settled, and this proposal only adds the per-call
+selector: BE is the deployed alt_bn128 encoding, and LE is the deployed
+[SIMD-0284] reversal of each coordinate, which turns the `c1 || c0` G2
+coordinate into `c0 || c1`.
+
+The Fp12 and GT layout is new consensus surface. The deployed pairing operation
+returns a boolean, so no GT byte layout exists on-chain to inherit. The ordering
+rule of the Encoding section makes each encoding coincide with an existing
+library serialization:
+
+- LE, ascending tower order with each Fq little-endian, is byte-for-byte the
+  arkworks canonical Fp12 serialization.
+- BE, its full byte reversal (descending order, each Fq big-endian), is
+  byte-for-byte the gnark-crypto GT marshaling, which writes `C1.B2.A1` first
+  down to `C0.B0.A0`.
+
+A verifier on either stack produces and compares GT bytes without
+re-serialization, and the two encodings remain mutual byte reversals, the rule
+[SIMD-0388] applies to its target group.

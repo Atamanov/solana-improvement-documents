@@ -74,12 +74,17 @@ the standard syscall argument registers, in the listed order. Address arguments
 are virtual-machine addresses of the typed values defined below. The first
 argument of every syscall, `encoding`, accepts exactly two values:
 
-```text
-ALT_BN128_BE = 0x00   big-endian, the deployed byte order
-ALT_BN128_LE = 0x80   little-endian
+```rust
+pub const LE_FLAG: u64 = 0x80;
+
+pub const ALT_BN128_BE: u64 = 0x00;
+pub const ALT_BN128_LE: u64 = ALT_BN128_BE | LE_FLAG;
 ```
 
-Any other value is misuse.
+`ALT_BN128_BE` selects the deployed big-endian byte order. `LE_FLAG` is the
+[SIMD-0284] bitmask that marks the little-endian variants of the deployed
+operation codes, so one flag convention covers both syscall families. Any other
+value is misuse.
 
 | Symbol | Arguments after `encoding` | Result bytes |
 | --- | --- | ---: |

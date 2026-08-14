@@ -26,21 +26,30 @@ syscalls remain unchanged.
 
 ## Motivation
 
-Solana programs verify Groth16 proofs with the deployed BN254 syscalls, one
-proof at a time. Batch verification shares work across proofs. Linear
-combinations become multi-scalar multiplications, and several pairing equations
-become one pairing product with one final exponentiation. The deployed interface
-does not expose those units of work. Its pairing operation returns only a
-boolean, so a program cannot cache a fixed pairing term or combine partial
-products, and every call re-derives the Miller line coefficients of G2 points
-that never change. Scalar-field arithmetic still often runs in sBPF.
+Zero-knowledge proof verification on Solana costs more than the underlying
+math requires. The deployed pairing syscall verifies Groth16 proofs one at a
+time, and each proof pays four pairings even though a fixed verifying key needs
+only three plus one cached term. Proofs of the same circuit cannot share work:
+the boolean pairing result cannot be combined across calls, and every call
+re-derives the Miller line coefficients of G2 points that never change. PLONK
+verifiers fare worse. Their field work (challenges, vanishing and Lagrange
+evaluations, batch inversion) runs in sBPF, and folding their commitments needs
+an MSM the runtime does not expose.
 
-This proposal exposes the shared work directly. G1 MSM performs the linear
-folds, the pairing pipeline prepares fixed G2 points once and combines Miller
-results before one final exponentiation, and the Fr helpers cover the field work
-that dominates polynomial-opening verifiers. This benefits proof relayers,
-privacy protocols, and compressed-state systems that verify the same circuit
-many times.
+The proposal targets three outcomes:
+
+1. Batch verification of many Groth16 proofs under one verifying key. Linear
+   folds become G1 MSMs, Miller products combine across calls, and one final
+   exponentiation serves the whole batch.
+2. A faster Miller loop over fixed G2 points. Prepared line coefficients remove
+   the per-call derivation and subgroup check, about a tenth of the loop cost,
+   to be pinned by the fitted cost schedules.
+3. Efficient PLONK verification. The Fr inner product and batch inversion cover
+   the field work, the MSM folds commitments, and the composable pairing checks
+   the KZG opening against a prepared fixed G2 point.
+
+This serves proof relayers, privacy protocols, and compressed-state systems
+that verify the same circuit many times.
 
 The new operations avoid the opaque-buffer pattern of `sol_alt_bn128_group_op`,
 whose byte-length contract required two later fixes ([SIMD-0222], [SIMD-0334]).

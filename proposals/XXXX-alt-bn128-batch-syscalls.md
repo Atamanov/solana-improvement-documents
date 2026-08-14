@@ -26,15 +26,15 @@ syscalls remain unchanged.
 
 ## Motivation
 
-Zero-knowledge proof verification on Solana costs more than the underlying
-math requires. The deployed pairing syscall verifies Groth16 proofs one at a
-time, and each proof pays four pairings even though a fixed verifying key needs
-only three plus one cached term. Proofs of the same circuit cannot share work:
-the boolean pairing result cannot be combined across calls, and every call
-re-derives the Miller line coefficients of G2 points that never change. PLONK
-verifiers fare worse. Their field work (challenges, vanishing and Lagrange
-evaluations, batch inversion) runs in sBPF, and folding their commitments needs
-an MSM the runtime does not expose.
+Zero-knowledge proof verification on Solana costs more than the underlying math
+requires and is not amortizable. The deployed pairing syscall verifies Groth16
+proofs one at a time, and each proof pays four pairings even though a fixed
+verifying key needs only three plus one cached term. Proofs of the same circuit
+cannot share work. The boolean pairing result cannot be combined across calls,
+and every call re-derives the Miller line coefficients of G2 points that never
+change. PLONK verifiers do worse. Their field work (challenges, vanishing and
+Lagrange evaluations, batch inversion) runs in sBPF, and folding their
+commitments needs an MSM the runtime does not expose.
 
 The proposal targets three outcomes:
 
@@ -42,14 +42,14 @@ The proposal targets three outcomes:
    folds become G1 MSMs, Miller products combine across calls, and one final
    exponentiation serves the whole batch.
 2. A faster Miller loop over fixed G2 points. Prepared line coefficients remove
-   the per-call derivation and subgroup check, about a tenth of the loop cost,
-   to be pinned by the fitted cost schedules.
+   the per-call derivation and subgroup check, about 10% of the loop cost, to be
+   pinned by the fitted cost schedules.
 3. Efficient PLONK verification. The Fr inner product and batch inversion cover
    the field work, the MSM folds commitments, and the composable pairing checks
    the KZG opening against a prepared fixed G2 point.
 
-This serves proof relayers, privacy protocols, and compressed-state systems
-that verify the same circuit many times.
+This serves proof relayers, privacy protocols, and compressed-state systems that
+verify the same circuit many times.
 
 The new operations avoid the opaque-buffer pattern of `sol_alt_bn128_group_op`,
 whose byte-length contract required two later fixes ([SIMD-0222], [SIMD-0334]).
